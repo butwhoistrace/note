@@ -14,6 +14,7 @@ import (
 	"github.com/butwhoistrace/note/internal/crypto"
 	"github.com/butwhoistrace/note/internal/display"
 	"github.com/butwhoistrace/note/internal/index"
+	"github.com/butwhoistrace/note/internal/meta"
 	"github.com/butwhoistrace/note/internal/store"
 )
 
@@ -30,7 +31,9 @@ func main() {
 	}
 
 	idx := index.New(s.BaseDir)
-	idx.Load()
+	if err := idx.Load(); err != nil {
+		display.Error(fmt.Sprintf("Warning: index corrupted, run 'note reindex': %v", err))
+	}
 
 	cmd := os.Args[1]
 	args := os.Args[2:]
@@ -144,11 +147,17 @@ func getPositional(args []string) []string {
 	return pos
 }
 
-func readPassword(prompt string) string {
+func readPassword(prompt string) []byte {
 	fmt.Printf("  %s", prompt)
 	reader := bufio.NewReader(os.Stdin)
 	pw, _ := reader.ReadString('\n')
-	return strings.TrimSpace(pw)
+	return []byte(strings.TrimSpace(pw))
+}
+
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
 }
 
 // === CORE COMMANDS ===
@@ -199,19 +208,10 @@ func cmdAdd(s *store.Store, idx *index.Index, args []string) {
 		}
 		text = strings.TrimSpace(string(data))
 	}
-	if err := s.AddLine(name, text); err != nil {
+	path, err := s.AddLine(name, text)
+	if err != nil {
 		display.Error(err.Error())
 		return
-	}
-	path := s.NotePath(name)
-	if _, err := os.Stat(path); err != nil {
-		entries, _ := os.ReadDir(s.NotesDir)
-		for _, e := range entries {
-			if strings.Contains(strings.ToLower(e.Name()), strings.ToLower(s.Slugify(name))) {
-				path = filepath.Join(s.NotesDir, e.Name())
-				break
-			}
-		}
 	}
 	idx.IndexFile(path)
 	idx.Save()
@@ -235,7 +235,7 @@ func cmdQuick(s *store.Store, idx *index.Index, args []string) {
 		}
 		s.CreateNote("Quick Notes", strings.Fields(tags))
 	}
-	if err := s.AddLine("Quick Notes", text); err != nil {
+	if _, err := s.AddLine("Quick Notes", text); err != nil {
 		display.Error(err.Error())
 		return
 	}
@@ -278,13 +278,13 @@ func cmdShow(s *store.Store, args []string) {
 		display.Error(err.Error())
 		return
 	}
-	meta := parseFrontmatter(content)
+	fm := meta.Parse(content)
 	fmt.Println()
-	display.NoteTitle(meta.title)
-	if len(meta.tags) > 0 {
-		display.NoteTags(meta.tags)
+	display.NoteTitle(fm.Title)
+	if len(fm.Tags) > 0 {
+		display.NoteTags(fm.Tags)
 	}
-	display.Info(meta.created)
+	display.Info(fm.Created)
 	fmt.Println()
 	display.NoteContent(content)
 	fmt.Println()
@@ -418,8 +418,8 @@ func cmdSearch(s *store.Store, idx *index.Index, args []string) {
 			if err != nil {
 				continue
 			}
-			meta := parseFrontmatter(string(content))
-			for _, t := range meta.tags {
+			fm := meta.Parse(string(content))
+			for _, t := range fm.Tags {
 				if strings.EqualFold(strings.TrimSpace(t), tagFilter) {
 					filtered = append(filtered, r)
 					break
@@ -681,11 +681,12 @@ func cmdEncrypt(s *store.Store, idx *index.Index, args []string) {
 		return
 	}
 	pw := readPassword("Password: ")
-	if pw == "" {
+	if len(pw) == 0 {
 		display.Error("Password cannot be empty.")
 		return
 	}
-	if err := crypto.EncryptFile(path, []byte(pw)); err != nil {
+	defer zeroBytes(pw)
+	if err := crypto.EncryptFile(path, pw); err != nil {
 		display.Error(err.Error())
 		return
 	}
@@ -706,7 +707,8 @@ func cmdDecrypt(s *store.Store, idx *index.Index, args []string) {
 		return
 	}
 	pw := readPassword("Password: ")
-	plaintext, err := crypto.DecryptFile(encPath, []byte(pw))
+	defer zeroBytes(pw)
+	plaintext, err := crypto.DecryptFile(encPath, pw)
 	if err != nil {
 		display.Error(err.Error())
 		return
@@ -722,10 +724,11 @@ func cmdDecrypt(s *store.Store, idx *index.Index, args []string) {
 
 func cmdLock(s *store.Store, idx *index.Index) {
 	pw := readPassword("Lock password: ")
-	if pw == "" {
+	if len(pw) == 0 {
 		display.Error("Password cannot be empty.")
 		return
 	}
+	defer zeroBytes(pw)
 	paths, err := s.GetAllNotePaths()
 	if err != nil {
 		display.Error(err.Error())
@@ -733,24 +736,25 @@ func cmdLock(s *store.Store, idx *index.Index) {
 	}
 	count := 0
 	for _, p := range paths {
-		if err := crypto.EncryptFile(p, []byte(pw)); err == nil {
+		if err := crypto.EncryptFile(p, pw); err == nil {
 			count++
 		}
 	}
 	// Also encrypt index
 	idxPath := filepath.Join(s.BaseDir, ".index")
-	crypto.EncryptFile(idxPath, []byte(pw))
+	crypto.EncryptFile(idxPath, pw)
 
 	display.Success(fmt.Sprintf("Locked %d notes.", count))
 }
 
 func cmdUnlock(s *store.Store, idx *index.Index) {
 	pw := readPassword("Unlock password: ")
+	defer zeroBytes(pw)
 
 	// Decrypt index first
 	idxPath := filepath.Join(s.BaseDir, ".index")
 	if _, err := os.Stat(idxPath + ".enc"); err == nil {
-		plaintext, err := crypto.DecryptFile(idxPath+".enc", []byte(pw))
+		plaintext, err := crypto.DecryptFile(idxPath+".enc", pw)
 		if err != nil {
 			display.Error("Wrong password.")
 			return
@@ -768,7 +772,7 @@ func cmdUnlock(s *store.Store, idx *index.Index) {
 	for _, e := range entries {
 		if strings.HasSuffix(e.Name(), ".enc") {
 			p := filepath.Join(s.NotesDir, e.Name())
-			plaintext, err := crypto.DecryptFile(p, []byte(pw))
+			plaintext, err := crypto.DecryptFile(p, pw)
 			if err != nil {
 				continue
 			}
@@ -817,7 +821,13 @@ func runHooks(s *store.Store, event string) {
 			continue
 		}
 		if strings.TrimSpace(parts[0]) == event {
-			cmd := exec.Command("sh", "-c", strings.TrimSpace(parts[1]))
+			hookCmd := strings.TrimSpace(parts[1])
+			// Split into args to avoid shell injection
+			fields := strings.Fields(hookCmd)
+			if len(fields) == 0 {
+				continue
+			}
+			cmd := exec.Command(fields[0], fields[1:]...)
 			cmd.Dir = s.BaseDir
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
@@ -937,11 +947,12 @@ func cmdImport(s *store.Store, idx *index.Index, args []string) {
 	}
 	target := getFlag(args, "--to")
 	if target != "" {
-		if err := s.AddLine(target, string(data)); err != nil {
+		path, err := s.AddLine(target, string(data))
+		if err != nil {
 			display.Error(err.Error())
 			return
 		}
-		idx.IndexFile(s.NotePath(target))
+		idx.IndexFile(path)
 		idx.Save()
 		display.Success(fmt.Sprintf("Imported to %s", target))
 	} else {
@@ -1032,38 +1043,6 @@ func cmdDoctor(s *store.Store, idx *index.Index) {
 }
 
 // === HELPERS ===
-
-type frontmatter struct {
-	title   string
-	tags    []string
-	created string
-}
-
-func parseFrontmatter(content string) frontmatter {
-	fm := frontmatter{}
-	if !strings.HasPrefix(content, "---") {
-		return fm
-	}
-	end := strings.Index(content[3:], "---")
-	if end < 0 {
-		return fm
-	}
-	header := content[3 : end+3]
-	for _, line := range strings.Split(header, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "title:") {
-			fm.title = strings.TrimSpace(strings.TrimPrefix(line, "title:"))
-		} else if strings.HasPrefix(line, "tags:") {
-			tagStr := strings.TrimSpace(strings.TrimPrefix(line, "tags:"))
-			if tagStr != "" {
-				fm.tags = strings.Split(tagStr, ",")
-			}
-		} else if strings.HasPrefix(line, "created:") {
-			fm.created = strings.TrimSpace(strings.TrimPrefix(line, "created:"))
-		}
-	}
-	return fm
-}
 
 func formatSize(bytes int64) string {
 	if bytes < 1024 {
