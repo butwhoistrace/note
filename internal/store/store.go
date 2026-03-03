@@ -4,8 +4,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/butwhoistrace/note/internal/meta"
 )
 
 type NoteMeta struct {
@@ -75,18 +78,18 @@ func (s *Store) CreateNote(title string, tags []string) error {
 	return os.WriteFile(path, []byte(frontmatter), 0644)
 }
 
-func (s *Store) AddLine(name string, text string) error {
+func (s *Store) AddLine(name string, text string) (string, error) {
 	path := s.findNote(name)
 	if path == "" {
-		return fmt.Errorf("note not found: %s", name)
+		return "", fmt.Errorf("note not found: %s", name)
 	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer f.Close()
 	_, err = f.WriteString(text + "\n")
-	return err
+	return path, err
 }
 
 func (s *Store) ReadNote(name string) (string, error) {
@@ -154,7 +157,7 @@ func (s *Store) EditLine(name string, lineNum int, newText string) error {
 		return fmt.Errorf("line %d out of range (1-%d)", lineNum, len(lines))
 	}
 	lines[lineNum-1] = newText
-	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644)
+	return writeAtomic(path, []byte(strings.Join(lines, "\n")))
 }
 
 func (s *Store) RemoveLine(name string, lineNum int) error {
@@ -171,7 +174,15 @@ func (s *Store) RemoveLine(name string, lineNum int) error {
 		return fmt.Errorf("line %d out of range (1-%d)", lineNum, len(lines))
 	}
 	lines = append(lines[:lineNum-1], lines[lineNum:]...)
-	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644)
+	return writeAtomic(path, []byte(strings.Join(lines, "\n")))
+}
+
+func writeAtomic(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func (s *Store) ListNotes(tagFilter string, sortBy string) ([]NoteMeta, error) {
@@ -324,19 +335,30 @@ func (s *Store) GetAllNotePaths() ([]string, error) {
 }
 
 func (s *Store) Stats() (int, int, map[string]int, error) {
-	notes, err := s.ListNotes("", "date")
+	entries, err := os.ReadDir(s.NotesDir)
 	if err != nil {
 		return 0, 0, nil, err
+	}
+	tags := make(map[string]int)
+	noteCount := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		noteCount++
+		meta := s.parseMeta(filepath.Join(s.NotesDir, e.Name()))
+		for _, t := range meta.Tags {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				tags[t]++
+			}
+		}
 	}
 	trash, err := s.ListTrash()
 	if err != nil {
 		return 0, 0, nil, err
 	}
-	tags, err := s.ListTags()
-	if err != nil {
-		return 0, 0, nil, err
-	}
-	return len(notes), len(trash), tags, nil
+	return noteCount, len(trash), tags, nil
 }
 
 // Internal helpers
@@ -347,76 +369,54 @@ func (s *Store) findNote(name string) string {
 	if _, err := os.Stat(path); err == nil {
 		return path
 	}
-	// Try fuzzy match on title in frontmatter
+	// Try exact title match, then prefix match
 	entries, err := os.ReadDir(s.NotesDir)
 	if err != nil {
 		return ""
 	}
 	nameLower := strings.ToLower(name)
+	var matches []string
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
 			continue
 		}
 		p := filepath.Join(s.NotesDir, e.Name())
-		meta := s.parseMeta(p)
-		if strings.EqualFold(meta.Title, name) || strings.Contains(strings.ToLower(meta.Title), nameLower) {
-			return p
+		m := s.parseMeta(p)
+		if strings.EqualFold(m.Title, name) {
+			return p // exact match wins immediately
 		}
+		if strings.HasPrefix(strings.ToLower(m.Title), nameLower) {
+			matches = append(matches, p)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0]
 	}
 	return ""
 }
 
 func (s *Store) parseMeta(path string) NoteMeta {
-	meta := NoteMeta{}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return meta
+		return NoteMeta{}
 	}
-	content := string(data)
-	if !strings.HasPrefix(content, "---") {
-		return meta
+	fm := meta.Parse(string(data))
+	created, _ := time.Parse("2006-01-02", fm.Created)
+	return NoteMeta{
+		Title:   fm.Title,
+		Tags:    fm.Tags,
+		Created: created,
 	}
-	end := strings.Index(content[3:], "---")
-	if end < 0 {
-		return meta
-	}
-	header := content[3 : end+3]
-	for _, line := range strings.Split(header, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "title:") {
-			meta.Title = strings.TrimSpace(strings.TrimPrefix(line, "title:"))
-		} else if strings.HasPrefix(line, "tags:") {
-			tagStr := strings.TrimSpace(strings.TrimPrefix(line, "tags:"))
-			if tagStr != "" {
-				meta.Tags = strings.Split(tagStr, ",")
-				for i := range meta.Tags {
-					meta.Tags[i] = strings.TrimSpace(meta.Tags[i])
-				}
-			}
-		} else if strings.HasPrefix(line, "created:") {
-			dateStr := strings.TrimSpace(strings.TrimPrefix(line, "created:"))
-			meta.Created, _ = time.Parse("2006-01-02", dateStr)
-		}
-	}
-	return meta
 }
 
 func sortByDate(notes []NoteMeta) {
-	for i := 0; i < len(notes); i++ {
-		for j := i + 1; j < len(notes); j++ {
-			if notes[j].Created.After(notes[i].Created) {
-				notes[i], notes[j] = notes[j], notes[i]
-			}
-		}
-	}
+	sort.Slice(notes, func(i, j int) bool {
+		return notes[i].Created.After(notes[j].Created)
+	})
 }
 
 func sortByName(notes []NoteMeta) {
-	for i := 0; i < len(notes); i++ {
-		for j := i + 1; j < len(notes); j++ {
-			if strings.ToLower(notes[i].Title) > strings.ToLower(notes[j].Title) {
-				notes[i], notes[j] = notes[j], notes[i]
-			}
-		}
-	}
+	sort.Slice(notes, func(i, j int) bool {
+		return strings.ToLower(notes[i].Title) < strings.ToLower(notes[j].Title)
+	})
 }
