@@ -2,6 +2,10 @@
 
 A minimal knowledge base for your terminal. Store anything, search everything, find it in seconds. No cloud, no account, just your notes on your machine.
 
+<p align="center">
+  <img src="gifani.gif" alt="note demo" width="700">
+</p>
+
 ## Installation
 
 ```
